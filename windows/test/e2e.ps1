@@ -20,8 +20,8 @@ public class W {
 }
 '@
 Add-Type -AssemblyName System.Drawing
-function SaverUp { $h = [W]::FindWindow('NightfallSaver', $null); return ($h -ne [IntPtr]::Zero) -and [W]::IsWindowVisible($h) }
-function SaverFocused { $h = [W]::FindWindow('NightfallSaver', $null); return ($h -ne [IntPtr]::Zero) -and ([W]::GetForegroundWindow() -eq $h) }
+function SaverUp { $h = [W]::FindWindow('NightfallSaver', [NullString]::Value); return ($h -ne [IntPtr]::Zero) -and [W]::IsWindowVisible($h) }
+function SaverFocused { $h = [W]::FindWindow('NightfallSaver', [NullString]::Value); return ($h -ne [IntPtr]::Zero) -and ([W]::GetForegroundWindow() -eq $h) }
 function Shot($name) { $p = Join-Path $out "$name.png"; & "$here\shot.ps1" $p; return $p }
 # Samples a grid; returns @(fraction of non-black samples, signature string of lit cells)
 function Analyze($png) {

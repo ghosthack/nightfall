@@ -29,6 +29,9 @@ done
 [ ${#hosts[@]} -gt 0 ] || { sed -n '2,16p' "$0"; exit 2; }
 
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=10)
+# version = latest vX.Y.Z tag in this checkout (0.0.0 before the first release)
+version=$(git -C "$root" describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null)
+version=${version#v}; version=${version:-0.0.0}
 summary=()
 built_win=0; built_mac=0
 
@@ -45,13 +48,14 @@ detect_os() {   # prints windows|macos|linux|unreachable
 build_windows() {
   [ $built_win = 1 ] && return 0
   command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "need mingw-w64: brew install mingw-w64" >&2; return 1; }
-  make -C "$root/windows" -s && built_win=1
+  make -C "$root/windows" -s -B VERSION="$version" && built_win=1
 }
 
 build_macos() {
   [ $built_mac = 1 ] && return 0
   [ "$(uname -s)" = Darwin ] || { echo "the macOS app must be built on a Mac" >&2; return 1; }
-  make -C "$root/macos" -s && built_mac=1
+  make -C "$root/macos" -s -B VERSION="$version" 2>&1 | grep -v 'replacing existing signature'
+  [ "${PIPESTATUS[0]}" = 0 ] && built_mac=1
 }
 
 deploy_windows() {
@@ -98,11 +102,12 @@ deploy_linux() {
       echo "$h: GTK4 headers missing; rerun with --install-deps (needs passwordless sudo)" >&2; return 1
     fi
   fi
-  "${SSH[@]}" "$h" 'cd ~/Projects/nightfall/linux && make -s -B && . test/env.sh && ./install.sh' || return 1
+  "${SSH[@]}" "$h" "cd ~/Projects/nightfall/linux && make -s -B VERSION=$version && . test/env.sh && ./install.sh" || return 1
   [ $test = 1 ] && "${SSH[@]}" "$h" '~/Projects/nightfall/linux/test/e2e.sh' | tee "/tmp/nightfall-deploy-$h.log"
   return 0
 }
 
+echo "Nightfall $version"
 for h in "${hosts[@]}"; do
   echo "==> $h"
   os=$(detect_os "$h")
