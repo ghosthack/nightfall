@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# End-to-end test on this Mac. Blanks the real screen for ~40 s total.
+# OS-level input injection needs Accessibility permission, so input is driven through the app's
+# real event path (NSApp.sendEvent) via its test hooks; state is checked from its debug log/PNGs.
+set -u
+app="$HOME/Applications/Nightfall.app"
+out=/tmp/nightfall-mac-e2e; rm -rf "$out"; mkdir -p "$out"
+log=$out/nightfall.log
+ok=0; fail=0
+check() { if eval "$2"; then echo "PASS $1"; ok=$((ok+1)); else echo "FAIL $1"; fail=$((fail+1)); fi; }
+running() { pgrep -x Nightfall >/dev/null; }
+
+pkill -x Nightfall; sleep 0.5
+# --- 1: scripted self-test through the real event path
+NIGHTFALL_DEBUG=$out NIGHTFALL_SELFTEST=1 "$app/Contents/MacOS/Nightfall" &
+for i in $(seq 120); do running || break; sleep 0.5; done
+check "hotkey Ctrl+Option+B registered" 'grep -q "launched hotkey_ok=true" $log'
+check "covers display, key window, above everything" 'grep -q "start display=0 .*covers=true key=true visible=true level=1000 .*app_active=true" $log'
+check "key during grace period ignored" 'grep -q "ignored (grace)" $log'
+check "mouse movement does not wake" 'grep -q "st: moved, active=true" $log'
+check "clock moved after 20 s" 'grep -q "clock moved" $log'
+check "key wakes" 'grep -q "st: after key, active=false" $log'
+check "left click wakes" 'grep -q "st: after click, active=false" $log'
+check "right click wakes" 'grep -q "st: after right click, active=false" $log'
+check "self-test exited" '! running'
+
+# --- 2: real launch + "open the app again" (Spotlight/Finder/Launchpad path) blanks
+mv $log $out/selftest.log
+open --env NIGHTFALL_DEBUG=$out --env NIGHTFALL_AUTOWAKE=4 "$app"; sleep 2
+check "launches into menu bar without blanking" 'running && grep -q launched $log && ! grep -q blank $log'
+p=$(pgrep -x Nightfall); echo "idle: rss $(ps -o rss= -p $p) KB"
+open "$app"; sleep 3
+check "re-opening the app blanks" 'grep -q reopen $log && grep -q "blank:" $log'
+echo "blanked: rss $(ps -o rss= -p $p) KB, cpu $(ps -o time= -p $p)"
+sleep 3
+check "autowake key wakes, app stays in menu bar" 'grep -q wake $log && running'
+check "single instance" '[ $(pgrep -x Nightfall | wc -l) -eq 1 ]'
+# leave it running normally (no debug env)
+pkill -x Nightfall; sleep 0.5; open "$app"; sleep 1
+check "running normally after test" 'running'
+echo "---- self-test log"; cat $out/selftest.log; echo "---- launch log"; cat $log
+echo "RESULT: $ok passed, $fail failed"

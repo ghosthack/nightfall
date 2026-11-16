@@ -1,0 +1,4 @@
+build/
+.DS_Store
+# your machine list for deploy.sh --all
+deploy.hosts
