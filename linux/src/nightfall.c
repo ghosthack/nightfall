@@ -240,8 +240,16 @@ static void activate(GtkApplication *app, gpointer data)
     g_timeout_add_seconds(1, tick, NULL);
 }
 
+#ifndef NIGHTFALL_VERSION
+#define NIGHTFALL_VERSION "0.0.0"
+#endif
+
 int main(int argc, char **argv)
 {
+    if (argc > 1 && g_strcmp0(argv[1], "--version") == 0) {
+        g_print("nightfall %s\n", NIGHTFALL_VERSION);
+        return 0;
+    }
     /* software rendering: a black screen with a little text needs no GPU context */
     g_setenv("GSK_RENDERER", "cairo", FALSE);
     g_debug = g_getenv("NIGHTFALL_DEBUG");

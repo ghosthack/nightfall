@@ -1,0 +1,36 @@
+name: CI
+
+# Builds all three platforms on every push and pull request (unsigned).
+# The end-to-end suites need a real desktop session, so they run via deploy.sh --test instead.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install --yes mingw-w64
+      - run: make -C windows
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install --yes libgtk-4-dev
+      - run: make -C linux && linux/build/nightfall --version
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - run: make -C macos && codesign --verify --strict macos/build/Nightfall.app

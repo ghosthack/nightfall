@@ -12,8 +12,10 @@ icons="$HOME/.local/share/icons/hicolor/scalable/apps"
 dock=1; shortcut=1
 for a in "$@"; do case "$a" in --no-dock) dock=0;; --no-shortcut) shortcut=0;; esac; done
 
-[ -x "$here/build/nightfall" ] || make -C "$here"
-install -Dm755 "$here/build/nightfall" "$bin"
+# release archives ship the binary next to this script; a source checkout builds it
+src="$here/nightfall"
+if [ ! -x "$src" ]; then src="$here/build/nightfall"; [ -x "$src" ] || make -C "$here"; fi
+install -Dm755 "$src" "$bin"
 install -Dm644 "$here/res/nightfall.svg" "$icons/nightfall.svg"
 mkdir -p "$apps"
 cat > "$apps/io.github.nightfall.desktop" <<DESK

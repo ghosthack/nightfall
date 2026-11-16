@@ -3,8 +3,12 @@
 IDI_APP ICON "nightfall.ico"
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "nightfall.manifest"
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+#ifndef NF_VERSION_COMMA
+#define NF_VERSION_COMMA 0,0,0,0
+#define NF_VERSION_STR "0.0.0"
+#endif
+FILEVERSION NF_VERSION_COMMA
+PRODUCTVERSION NF_VERSION_COMMA
 FILEOS VOS_NT_WINDOWS32
 FILETYPE VFT_APP
 BEGIN
@@ -14,8 +18,8 @@ BEGIN
     BEGIN
       VALUE "FileDescription", "Nightfall screen blanker"
       VALUE "ProductName", "Nightfall"
-      VALUE "FileVersion", "1.0.0"
-      VALUE "ProductVersion", "1.0.0"
+      VALUE "FileVersion", NF_VERSION_STR
+      VALUE "ProductVersion", NF_VERSION_STR
       VALUE "OriginalFilename", "nightfall.exe"
     END
   END

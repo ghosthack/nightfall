@@ -1,0 +1,366 @@
+name: Release
+
+# Pushing a vX.Y.Z tag builds, signs and publishes a GitHub Release for all three platforms.
+# Running it by hand is a dry run unless `publish` is ticked; untick `sign` to test the build
+# without signing credentials (publishing always signs).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Numeric release version (X.Y.Z, X >= 1)
+        required: true
+        default: "1.0.0"
+      publish:
+        description: Publish a GitHub Release after packaging
+        type: boolean
+        required: true
+        default: false
+      sign:
+        description: Sign (Windows) and sign + notarize (macOS)
+        type: boolean
+        required: true
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      tag: ${{ steps.release.outputs.tag }}
+      sign: ${{ steps.release.outputs.sign }}
+    steps:
+      - name: Validate release version
+        id: release
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+          INPUT_SIGN: ${{ inputs.sign }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="$GITHUB_REF_NAME"; version="${tag#v}"; sign=true
+          else
+            version="$INPUT_VERSION"; tag="v$version"
+            sign="$INPUT_SIGN"; [[ "$INPUT_PUBLISH" == true ]] && sign=true
+          fi
+          if [[ ! "$tag" =~ ^v[1-9][0-9]*\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tag must be exactly vX.Y.Z with X >= 1 (got '$tag')" >&2
+            exit 1
+          fi
+          {
+            echo "version=$version"
+            echo "tag=$tag"
+            echo "sign=$sign"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Reject publishing an existing version
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists; publish a higher X.Y.Z." >&2
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------- Windows
+  windows-build:
+    needs: metadata
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install mingw-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes mingw-w64
+      - name: Build nightfall.exe
+        run: make -C windows VERSION=${{ needs.metadata.outputs.version }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-unsigned
+          path: windows/build/nightfall.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-package:
+    needs: [metadata, windows-build]
+    runs-on: windows-2025
+    environment: release-signing
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-unsigned
+          path: windows/build
+
+      - name: Log in to Azure with GitHub OIDC
+        if: needs.metadata.outputs.sign == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign nightfall.exe
+        if: needs.metadata.outputs.sign == 'true'
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82 # v2.0.0
+        with:
+          endpoint: ${{ vars.ARTIFACT_SIGNING_ENDPOINT }}
+          signing-account-name: ${{ vars.ARTIFACT_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ vars.ARTIFACT_SIGNING_PROFILE }}
+          files: ${{ github.workspace }}\windows\build\nightfall.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify signature, timestamp and version
+        shell: pwsh
+        env:
+          SIGNED: ${{ needs.metadata.outputs.sign }}
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'windows\build\nightfall.exe'
+          $v = (Get-Item $exe).VersionInfo.ProductVersion
+          if ($v -ne $env:RELEASE_VERSION) { throw "ProductVersion is '$v', expected '$env:RELEASE_VERSION'" }
+          if ($env:SIGNED -eq 'true') {
+            $s = Get-AuthenticodeSignature -FilePath $exe
+            if ($s.Status -ne 'Valid') { throw "Invalid Authenticode signature: $($s.Status)" }
+            if ($null -eq $s.TimeStamperCertificate) { throw 'Missing Authenticode timestamp' }
+            Write-Host "Signed by: $($s.SignerCertificate.Subject)"
+          } else {
+            Write-Host 'Unsigned dry run.'
+          }
+
+      - name: Smoke-test the executable
+        shell: pwsh
+        run: |
+          # /c would open a message box; /p (screensaver preview) exits immediately with 0
+          $p = Start-Process -FilePath windows\build\nightfall.exe -ArgumentList '/p','0' -PassThru -Wait
+          if ($p.ExitCode -ne 0) { throw "nightfall.exe /p exited with $($p.ExitCode)" }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "nightfall-$env:RELEASE_VERSION-windows-x64"
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Path $stage | Out-Null
+          Copy-Item windows\build\nightfall.exe, windows\install.ps1, windows\uninstall.ps1, LICENSE, README.md $stage
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Compress-Archive -Path $stage -DestinationPath "dist\$name.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-windows
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ------------------------------------------------------------------ macOS
+  macos-package:
+    needs: metadata
+    runs-on: macos-15
+    environment: release
+    env:
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+      SIGN: ${{ needs.metadata.outputs.sign }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Import the Developer ID certificate
+        if: needs.metadata.outputs.sign == 'true'
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          if [[ -z "$CERTIFICATE_BASE64" ]]; then
+            echo "Signing requested but MACOS_CERTIFICATE_BASE64 is not set." >&2
+            exit 1
+          fi
+          certificate="$RUNNER_TEMP/signing.p12"
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          printf '%s' "$CERTIFICATE_BASE64" | openssl base64 -d -A -out "$certificate"
+          security create-keychain -p actions "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p actions "$keychain"
+          security import "$certificate" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          intermediate="$RUNNER_TEMP/DeveloperIDG2CA.cer"
+          curl --fail --silent --show-error --location \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer --output "$intermediate"
+          intermediate_sha256="$(openssl x509 -inform DER -in "$intermediate" \
+            -noout -fingerprint -sha256 | cut -d= -f2 | tr -d :)"
+          if [[ "$intermediate_sha256" != \
+                F16CD3C54C7F83CEA4BF1A3E6A0819C8AAA8E4A1528FD144715F350643D2DF3A ]]; then
+            echo "Unexpected Developer ID G2 intermediate fingerprint." >&2
+            exit 1
+          fi
+          security add-certificates -k "$keychain" "$intermediate"
+          security set-key-partition-list -S apple-tool:,apple: -s -k actions "$keychain"
+          security list-keychains -d user -s "$keychain"
+          count="$(security find-identity -v -p codesigning "$keychain" | \
+            sed -n 's/^ *\([0-9][0-9]*\) valid identities found$/\1/p')"
+          if [[ "$count" != "1" ]]; then
+            echo "Expected exactly one valid signing identity." >&2
+            exit 1
+          fi
+          echo "MACOS_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          rm -f "$certificate" "$intermediate"
+
+      - name: Build the universal app
+        env:
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          identity=-
+          if [[ "$SIGN" == true ]]; then
+            [[ -n "$SIGNING_IDENTITY" ]] || { echo "MACOS_SIGNING_IDENTITY is not set." >&2; exit 1; }
+            identity="$SIGNING_IDENTITY"
+          fi
+          make -C macos VERSION="$RELEASE_VERSION" SIGN_IDENTITY="$identity"
+          app=macos/build/Nightfall.app
+          codesign --verify --strict --verbose=2 "$app"
+          lipo -archs "$app/Contents/MacOS/Nightfall"
+          v="$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")"
+          [[ "$v" == "$RELEASE_VERSION" ]] || { echo "Info.plist version is $v" >&2; exit 1; }
+
+      - name: Notarize and staple
+        if: needs.metadata.outputs.sign == 'true'
+        env:
+          NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+        run: |
+          if [[ -z "$NOTARY_APPLE_ID" || -z "$NOTARY_PASSWORD" || -z "$NOTARY_TEAM_ID" ]]; then
+            echo "Signing requested but the notarization credentials are incomplete." >&2
+            exit 1
+          fi
+          app=macos/build/Nightfall.app
+          upload="$RUNNER_TEMP/notarize.zip"
+          ditto -c -k --keepParent "$app" "$upload"
+          submission="$RUNNER_TEMP/notary.json"
+          xcrun notarytool submit "$upload" --wait \
+            --apple-id "$NOTARY_APPLE_ID" --password "$NOTARY_PASSWORD" --team-id "$NOTARY_TEAM_ID" \
+            --output-format json > "$submission"
+          cat "$submission"
+          id="$(jq -r '.id // empty' "$submission")"
+          status="$(jq -r '.status // empty' "$submission")"
+          if [[ "$status" != Accepted ]]; then
+            echo "Notarization failed: $status" >&2
+            [[ -n "$id" ]] && xcrun notarytool log "$id" \
+              --apple-id "$NOTARY_APPLE_ID" --password "$NOTARY_PASSWORD" --team-id "$NOTARY_TEAM_ID" || true
+            exit 1
+          fi
+          # stapling fetches the ticket from Apple's CDN; runner network drops are common
+          for attempt in 1 2 3 4 5; do
+            if xcrun stapler staple "$app" && xcrun stapler validate "$app"; then break; fi
+            (( attempt == 5 )) && { echo "Stapling failed." >&2; exit 1; }
+            sleep $((attempt * 30))
+          done
+          spctl -a -t exec -vv "$app"
+
+      - name: Package
+        run: |
+          name="nightfall-$RELEASE_VERSION-macos-universal"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage" dist
+          ditto macos/build/Nightfall.app "$stage/Nightfall.app"
+          cp macos/install.sh macos/uninstall.sh LICENSE README.md "$stage/"
+          ditto -c -k --keepParent "$stage" "dist/$name.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-macos
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove the temporary signing keychain
+        if: always()
+        run: |
+          if [[ -n "${MACOS_KEYCHAIN:-}" && -f "$MACOS_KEYCHAIN" ]]; then
+            security delete-keychain "$MACOS_KEYCHAIN"
+          fi
+
+  # ------------------------------------------------------------------ Linux
+  linux-package:
+    needs: metadata
+    # built on the oldest supported Ubuntu so the binary also runs on newer ones
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install GTK4
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libgtk-4-dev
+      - name: Build
+        run: |
+          make -C linux VERSION="$RELEASE_VERSION"
+          out="$(linux/build/nightfall --version)"
+          [[ "$out" == "nightfall $RELEASE_VERSION" ]] || { echo "--version printed '$out'" >&2; exit 1; }
+      - name: Package
+        run: |
+          name="nightfall-$RELEASE_VERSION-linux-x64"
+          stage="$RUNNER_TEMP/$name"
+          mkdir -p "$stage/res" dist
+          cp linux/build/nightfall linux/install.sh linux/uninstall.sh LICENSE README.md "$stage/"
+          cp linux/res/nightfall.svg "$stage/res/"
+          tar -C "$RUNNER_TEMP" -czf "dist/$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-linux
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------- publish
+  publish:
+    needs: [metadata, windows-package, macos-package, linux-package]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA-256 checksums
+        working-directory: dist
+        run: |
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' | sort -z | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG appeared after validation; refusing to replace it." >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" dist/* --target "$GITHUB_SHA" \
+            --title "Nightfall $RELEASE_VERSION" --generate-notes
