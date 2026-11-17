@@ -6,12 +6,16 @@
  *   nightfall.exe /tray      stay in the notification area:
  *                              - left-click the moon icon  -> blank now
  *                              - Ctrl+Alt+B (global hotkey) -> blank now
- *                              - right-click               -> menu (blank / start with Windows / exit)
+ *                              - right-click               -> menu (blank / clock, digital rain or
+ *                                                             gray mosaic / start with Windows / exit)
+ *   add /rain, /mosaic or /clock to any of these to override the saved style (HKCU\Software\Nightfall)
  *   nightfall.exe /c         about box (Windows "Settings" button for a .scr)
  *   nightfall.exe /p <hwnd>  preview (ignored, exits)
  *
- * While blanked: one black window covers every monitor, the cursor is hidden,
- * and a dim clock jumps to a random spot every 20 s so nothing is ever burned in.
+ * While blanked: one black window covers every monitor, the cursor is hidden, and either
+ * a dim clock jumps to a random spot every 20 s so nothing is ever burned in, a dim
+ * green digital rain falls (15 frames/s, redrawing only the cells that change), or each
+ * monitor becomes a mosaic of dark gray rectangles that slowly crossfade to new shades.
  * Any key or mouse click dismisses it (mouse movement alone does not, so a bumped
  * mouse won't wake it). CPU use is a 1 Hz timer that usually does nothing.
  */
@@ -26,11 +30,14 @@
 #include <shellapi.h>
 #include <wchar.h>
 #include "resource.h"
+#include "rain.h"
+#include "mosaic.h"
 
 #define APP_NAME        L"Nightfall"
 #define TRAY_CLASS      L"NightfallTray"
 #define SAVER_CLASS     L"NightfallSaver"
 #define RUN_KEY         L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+#define APP_KEY         L"Software\\Nightfall"
 
 #define WM_TRAY         (WM_APP + 1)
 #define ID_HOTKEY       1
@@ -38,7 +45,11 @@
 #define IDM_START       100
 #define IDM_AUTOSTART   101
 #define IDM_EXIT        102
+#define IDM_MODE_CLOCK  103
+#define IDM_MODE_RAIN   104
+#define IDM_MODE_MOSAIC 105
 #define TIMER_TICK      1
+#define TIMER_ANIM      2       /* rain or mosaic frames */
 
 #define GRACE_MS        800     /* ignore input right after blanking (key release of the hotkey etc.) */
 #define MOVE_MS         20000   /* move the clock this often */
@@ -60,6 +71,39 @@ static int       g_time_h;
 
 static RECT      g_monitors[MAX_MONITORS];
 static int       g_monitor_count;
+
+enum { MODE_CLOCK, MODE_RAIN, MODE_MOSAIC };
+static int       g_mode_override = -1;  /* /rain, /mosaic or /clock on the command line */
+static int       g_mode;                /* style of the saver currently shown */
+
+/* digital rain */
+static Rain      g_rain;
+static HDC       g_atlas_dc;            /* every glyph at every brightness, cell x cell each */
+static HBITMAP   g_atlas_bmp, g_atlas_old;
+static int       g_cell;
+
+/* gray mosaic: one grid per monitor, sized to that monitor's resolution */
+static Mosaic    g_mosaic[MAX_MONITORS];
+static POINT     g_mosaic_org[MAX_MONITORS];    /* monitor origin, client coordinates */
+static int       g_mosaic_count;
+
+static int mode_get(void)
+{
+    DWORD v = 0, n = sizeof v;
+    if (g_mode_override >= 0) return g_mode_override;
+    if (RegGetValueW(HKEY_CURRENT_USER, APP_KEY, L"Mode", RRF_RT_REG_DWORD, NULL, &v, &n) != ERROR_SUCCESS) v = 0;
+    return v <= MODE_MOSAIC ? (int)v : MODE_CLOCK;
+}
+
+static void mode_set(int m)
+{
+    DWORD v = (DWORD)m;
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, APP_KEY, 0, NULL, 0, KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS) return;
+    RegSetValueExW(k, L"Mode", 0, REG_DWORD, (const BYTE *)&v, sizeof v);
+    RegCloseKey(k);
+    g_mode_override = -1;
+}
 
 /* ---------- small helpers ---------- */
 
@@ -144,6 +188,116 @@ static void place_clock(HWND hwnd)
     g_text_rc.bottom = g_text_rc.top + h;
 }
 
+/* ---------- digital rain ---------- */
+
+static void rain_start(HWND hwnd)
+{
+    RECT rc;
+    HDC dc;
+    HFONT font, oldf;
+    BITMAPINFO bi;
+    void *bits;
+    int c, g, lv;
+
+    GetClientRect(hwnd, &rc);
+    c = GetSystemMetrics(SM_CYSCREEN) / 36;
+    if (c < 14) c = 14;
+    g_cell = c;
+    rain_init(&g_rain, rc.right / c + 1, rc.bottom / c + 1, GetTickCount() ^ (GetCurrentProcessId() << 16));
+
+    dc = GetDC(hwnd);
+    g_atlas_dc = CreateCompatibleDC(dc);
+    ZeroMemory(&bi, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = RAIN_GLYPHS * c;
+    bi.bmiHeader.biHeight = -RAIN_LEVELS * c;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g_atlas_bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    ReleaseDC(hwnd, dc);
+    g_atlas_old = SelectObject(g_atlas_dc, g_atlas_bmp);
+    PatBlt(g_atlas_dc, 0, 0, RAIN_GLYPHS * c, RAIN_LEVELS * c, BLACKNESS);
+
+    font = CreateFontW(-(c * 4 / 5), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                       CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FIXED_PITCH, L"MS Gothic");
+    oldf = SelectObject(g_atlas_dc, font);
+    SetBkMode(g_atlas_dc, TRANSPARENT);
+    for (lv = 1; lv < RAIN_LEVELS; lv++) {
+        int r, gr, b;
+        rain_color(lv, &r, &gr, &b);
+        SetTextColor(g_atlas_dc, RGB(r, gr, b));
+        for (g = 0; g < RAIN_GLYPHS; g++) {
+            wchar_t ch = (wchar_t)rain_glyph_cp(g);
+            RECT cell = { g * c, lv * c, (g + 1) * c, (lv + 1) * c };
+            DrawTextW(g_atlas_dc, &ch, 1, &cell, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
+        }
+    }
+    SelectObject(g_atlas_dc, oldf);
+    DeleteObject(font);
+    SetTimer(hwnd, TIMER_ANIM, 1000 / RAIN_FPS, NULL);
+}
+
+static void rain_blit(int col, int row, int level, int glyph, void *ctx)
+{
+    BitBlt((HDC)ctx, col * g_cell, row * g_cell, g_cell, g_cell,
+           g_atlas_dc, glyph * g_cell, level * g_cell, SRCCOPY);
+}
+
+static void rain_stop(HWND hwnd)
+{
+    KillTimer(hwnd, TIMER_ANIM);
+    if (g_atlas_dc) {
+        SelectObject(g_atlas_dc, g_atlas_old);
+        DeleteObject(g_atlas_bmp);
+        DeleteDC(g_atlas_dc);
+        g_atlas_dc = NULL;
+    }
+    rain_free(&g_rain);
+}
+
+/* ---------- gray mosaic ---------- */
+
+static void mosaic_start(HWND hwnd)
+{
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    g_mosaic_count = 0;
+    for (int i = 0; i < g_monitor_count; i++) {
+        RECT m = g_monitors[i];
+        if (!mosaic_init(&g_mosaic[i], m.right - m.left, m.bottom - m.top,
+                         GetTickCount() ^ (GetCurrentProcessId() << 16) ^ (unsigned)(i * 7919))) break;
+        g_mosaic_org[i].x = m.left - vx;
+        g_mosaic_org[i].y = m.top - vy;
+        g_mosaic_count = i + 1;
+    }
+    SetTimer(hwnd, TIMER_ANIM, 1000 / MOSAIC_FPS, NULL);
+}
+
+typedef struct { HDC dc; POINT org; } MosaicPaint;
+
+static void mosaic_fill(int x, int y, int w, int h, int gray, void *ctx)
+{
+    MosaicPaint *p = ctx;
+    RECT r = { p->org.x + x, p->org.y + y, p->org.x + x + w, p->org.y + y + h };
+    SetDCBrushColor(p->dc, RGB(gray, gray, gray));
+    FillRect(p->dc, &r, (HBRUSH)GetStockObject(DC_BRUSH));
+}
+
+static void mosaic_paint(HDC dc, int all)
+{
+    for (int i = 0; i < g_mosaic_count; i++) {
+        MosaicPaint p = { dc, g_mosaic_org[i] };
+        mosaic_update(&g_mosaic[i], all, mosaic_fill, &p);
+    }
+}
+
+static void mosaic_stop(HWND hwnd)
+{
+    KillTimer(hwnd, TIMER_ANIM);
+    for (int i = 0; i < g_mosaic_count; i++) mosaic_free(&g_mosaic[i]);
+    g_mosaic_count = 0;
+}
+
 /* ---------- saver window ---------- */
 
 static void saver_dismiss(HWND hwnd)
@@ -159,15 +313,32 @@ static LRESULT CALLBACK saver_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_saver_start = g_last_move = GetTickCount();
         g_monitor_count = 0;
         EnumDisplayMonitors(NULL, NULL, monitor_enum, 0);
-        place_clock(hwnd);
+        g_mode = mode_get();
+        if (g_mode == MODE_RAIN) rain_start(hwnd);
+        else if (g_mode == MODE_MOSAIC) mosaic_start(hwnd);
+        else place_clock(hwnd);
         SetTimer(hwnd, TIMER_TICK, 1000, NULL);
         return 0;
 
     case WM_TIMER: {
         SYSTEMTIME st;
         DWORD now = GetTickCount();
+        if (wp == TIMER_ANIM) {
+            HDC dc = GetDC(hwnd);
+            if (g_mode == MODE_RAIN) {
+                rain_step(&g_rain);
+                rain_update(&g_rain, 0, rain_blit, dc);
+            } else {
+                for (int i = 0; i < g_mosaic_count; i++) mosaic_step(&g_mosaic[i]);
+                mosaic_paint(dc, 0);
+            }
+            ReleaseDC(hwnd, dc);
+            return 0;
+        }
         GetLocalTime(&st);
-        if (now - g_last_move >= MOVE_MS) {
+        if (g_mode != MODE_CLOCK) {
+            /* nothing to move */
+        } else if (now - g_last_move >= MOVE_MS) {
             g_last_move = now;
             InvalidateRect(hwnd, &g_text_rc, TRUE);    /* erase old spot */
             place_clock(hwnd);
@@ -186,6 +357,16 @@ static LRESULT CALLBACK saver_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SYSTEMTIME st;
         RECT r;
         HDC dc = BeginPaint(hwnd, &ps);
+        if (g_mode == MODE_RAIN) {
+            if (g_atlas_dc) rain_update(&g_rain, 1, rain_blit, dc);    /* background is already black */
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+        if (g_mode == MODE_MOSAIC) {
+            mosaic_paint(dc, 1);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
         format_clock(tbuf, 64, dbuf, 128, &st);
         g_last_minute = st.wMinute;
         SetBkMode(dc, TRANSPARENT);
@@ -226,12 +407,16 @@ static LRESULT CALLBACK saver_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                      GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN), 0);
         g_monitor_count = 0;
         EnumDisplayMonitors(NULL, NULL, monitor_enum, 0);
-        place_clock(hwnd);
+        if (g_mode == MODE_RAIN) { rain_stop(hwnd); rain_start(hwnd); }
+        else if (g_mode == MODE_MOSAIC) { mosaic_stop(hwnd); mosaic_start(hwnd); }
+        else place_clock(hwnd);
         InvalidateRect(hwnd, NULL, TRUE);
         return 0;
 
     case WM_DESTROY:
         KillTimer(hwnd, TIMER_TICK);
+        rain_stop(hwnd);
+        mosaic_stop(hwnd);
         if (g_font_time) { DeleteObject(g_font_time); g_font_time = NULL; }
         if (g_font_date) { DeleteObject(g_font_date); g_font_date = NULL; }
         g_saver_wnd = NULL;
@@ -314,6 +499,12 @@ static void tray_menu(HWND hwnd)
     POINT pt;
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, IDM_START, L"&Blank screen now\tCtrl+Alt+B");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_MODE_CLOCK, L"&Clock");
+    AppendMenuW(m, MF_STRING, IDM_MODE_RAIN, L"Digital &rain");
+    AppendMenuW(m, MF_STRING, IDM_MODE_MOSAIC, L"Gray &mosaic");
+    CheckMenuRadioItem(m, IDM_MODE_CLOCK, IDM_MODE_MOSAIC, IDM_MODE_CLOCK + mode_get(), MF_BYCOMMAND);
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING | (autostart_get() ? MF_CHECKED : 0), IDM_AUTOSTART, L"Start with &Windows");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, IDM_EXIT, L"E&xit");
@@ -353,6 +544,9 @@ static LRESULT CALLBACK tray_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         switch (LOWORD(wp)) {
         case IDM_START:     saver_start(); break;
         case IDM_AUTOSTART: autostart_set(!autostart_get()); break;
+        case IDM_MODE_CLOCK: mode_set(MODE_CLOCK); break;
+        case IDM_MODE_RAIN:  mode_set(MODE_RAIN); break;
+        case IDM_MODE_MOSAIC: mode_set(MODE_MOSAIC); break;
         case IDM_EXIT:      DestroyWindow(hwnd); break;
         }
         return 0;
@@ -390,13 +584,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
     (void)prev; (void)cmdline; (void)show;
 
     g_inst = inst;
+    for (int i = 1; i < argc; i++) {
+        if (arg_word(argv[i], L"rain")) g_mode_override = MODE_RAIN;
+        else if (arg_word(argv[i], L"mosaic")) g_mode_override = MODE_MOSAIC;
+        else if (arg_word(argv[i], L"clock")) g_mode_override = MODE_CLOCK;
+    }
     g_icon_small = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
                                      GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
 
     if (arg_is(a1, L'p')) return 0;                               /* preview: nothing to show */
     if (arg_is(a1, L'c')) {
         MessageBoxW(NULL,
-            L"Nightfall blanks every screen with a dim, wandering clock.\n\n"
+            L"Nightfall blanks every screen with a dim, wandering clock, a digital rain or a\n"
+            L"slowly shifting gray mosaic (pick one from the tray menu, or add /clock, /rain\n"
+            L"or /mosaic).\n\n"
             L"Dismiss: any key or mouse click (moving the mouse does not wake it).\n"
             L"Tray mode: run  nightfall.exe /tray  - click the moon or press Ctrl+Alt+B.",
             APP_NAME, MB_OK | MB_ICONINFORMATION);

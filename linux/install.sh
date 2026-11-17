@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs Nightfall for the current user (GNOME). No root needed once built.
 #   - ~/.local/bin/nightfall
-#   - app-grid entry "Nightfall" (+ pinned to the dock)
+#   - app-grid entry "Nightfall" (+ pinned to the dock; right-click it to pick clock or digital rain)
 #   - GNOME shortcut Ctrl+Alt+B -> nightfall
 #   flags: --no-dock  --no-shortcut
 set -euo pipefail
@@ -28,6 +28,19 @@ Icon=nightfall
 Terminal=false
 Categories=Utility;
 StartupNotify=false
+Actions=rain;mosaic;clock;
+
+[Desktop Action rain]
+Name=Blank with Digital Rain
+Exec=$bin --rain
+
+[Desktop Action mosaic]
+Name=Blank with Gray Mosaic
+Exec=$bin --mosaic
+
+[Desktop Action clock]
+Name=Blank with Clock
+Exec=$bin --clock
 DESK
 update-desktop-database "$apps" 2>/dev/null || true
 gtk-update-icon-cache -q "$HOME/.local/share/icons/hicolor" 2>/dev/null || true

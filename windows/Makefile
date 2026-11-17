@@ -9,7 +9,7 @@ CFLAGS  = -O2 -Wall -Wextra -municode -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0A00
 LDFLAGS = -mwindows -municode -s -static-libgcc
 LIBS    = -lshell32 -luser32 -lgdi32 -ladvapi32
 
-build/nightfall.exe: src/nightfall.c src/resource.h build/res.o
+build/nightfall.exe: src/nightfall.c src/resource.h src/rain.h src/mosaic.h build/res.o
 	$(CC) $(CFLAGS) -o $@ src/nightfall.c build/res.o $(LDFLAGS) $(LIBS)
 
 build/res.o: res/nightfall.rc res/nightfall.ico res/nightfall.manifest src/resource.h

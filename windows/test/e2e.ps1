@@ -67,4 +67,37 @@ Check 'mouse click wakes' (-not (SaverUp))
 Start-Sleep 1
 Check 'shortcut instance exits after wake' (@(Get-Process nightfall).Count -eq $before)
 
+# --- digital rain: one-off /rain, then the saved style from the registry
+$exe = Join-Path $env:LOCALAPPDATA 'Programs\Nightfall\nightfall.exe'
+$r = Start-Process $exe -ArgumentList '/s', '/rain' -PassThru; Start-Sleep 3
+Check '/rain shows the saver' (SaverUp)
+$a = Analyze (Shot 'rain-1'); Start-Sleep -Milliseconds 700; $b = Analyze (Shot 'rain-2')
+Check 'rain fills the screen with glyphs (>3% lit)' ($a[0] -gt 0.03)
+Check 'rain is animating' ($a[1] -ne $b[1])
+$c0 = $r.TotalProcessorTime; Start-Sleep 5; $r.Refresh()
+Say ("rain: working set {0} KB, CPU {1:N1}% of one core" -f [int]($r.WorkingSet64 / 1KB), (($r.TotalProcessorTime - $c0).TotalMilliseconds / 50))
+Input key; Start-Sleep 1
+Check 'key wakes the rain' (-not (SaverUp))
+$key = 'HKCU:\Software\Nightfall'
+$old = (Get-ItemProperty $key -Name Mode -ErrorAction SilentlyContinue).Mode
+if (-not (Test-Path $key)) { New-Item $key | Out-Null }
+Set-ItemProperty $key -Name Mode -Value 1 -Type DWord
+Start-Process $lnk; Start-Sleep 3
+$a = Analyze (Shot 'rain-saved')
+Check 'saved style (Mode=1) makes the shortcut use the rain' ((SaverUp) -and ($a[0] -gt 0.03))
+Input key; Start-Sleep 1
+if ($null -eq $old) { Remove-ItemProperty $key -Name Mode } else { Set-ItemProperty $key -Name Mode -Value $old -Type DWord }
+Check 'style restored, rain closed' ((-not (SaverUp)) -and ((Get-ItemProperty $key -Name Mode -ErrorAction SilentlyContinue).Mode -eq $old))
+
+# --- gray mosaic: one-off /mosaic
+$m = Start-Process $exe -ArgumentList '/s', '/mosaic' -PassThru; Start-Sleep 3
+Check '/mosaic shows the saver' (SaverUp)
+$a = Analyze (Shot 'mosaic-1'); Start-Sleep 3; $b = Analyze (Shot 'mosaic-2')
+Check 'mosaic covers the screen with gray cells (>30% lit)' ($a[0] -gt 0.3)
+Check 'mosaic is changing' ($a[1] -ne $b[1])
+$c0 = $m.TotalProcessorTime; Start-Sleep 5; $m.Refresh()
+Say ("mosaic: working set {0} KB, CPU {1:N1}% of one core" -f [int]($m.WorkingSet64 / 1KB), (($m.TotalProcessorTime - $c0).TotalMilliseconds / 50))
+Input key; Start-Sleep 1
+Check 'key wakes the mosaic' (-not (SaverUp))
+
 Say "RESULT: $script:ok passed, $script:fail failed"

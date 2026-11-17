@@ -41,6 +41,32 @@ sleep 4
 if [ -n "$(pid)" ]; then inp esc; sleep 1; fi
 check "Esc wakes too" '[ -z "$(pid)" ] && grep -q "key Escape" $out/nightfall.log'
 
+# --- 4: digital rain (one-off flag, then the saved style)
+mv $out/nightfall.log $out/clock.log
+NIGHTFALL_DEBUG=$out "$bin" --rain & sleep 4
+check "--rain blanks with the digital rain" '[ -n "$(pid)" ] && grep -q "mode=rain" $out/nightfall.log && grep -q "^.* rain: " $out/nightfall.log'
+p=$(pid); [ -n "$p" ] && { t0=$(cut -d" " -f14,15 /proc/$p/stat); sleep 5; t1=$(cut -d" " -f14,15 /proc/$p/stat)
+  echo "rain: rss $(ps -o rss= -p $p) KB, cpu $(echo $t0 $t1 | awk '{print ($3+$4-$1-$2)/5 "% of one core"}')"; }
+inp key; sleep 1
+check "key wakes the rain" '[ -z "$(pid)" ]'
+modefile="${XDG_CONFIG_HOME:-$HOME/.config}/nightfall/mode"
+saved=$(cat "$modefile" 2>/dev/null)
+"$bin" --set-mode rain >/dev/null
+NIGHTFALL_DEBUG=$out "$bin" & sleep 3
+check "saved style is used (--set-mode rain)" 'grep -c "mode=rain" $out/nightfall.log | grep -q 2'
+inp key; sleep 1
+if [ -n "$saved" ]; then "$bin" --set-mode "$saved" >/dev/null; else rm -f "$modefile"; fi
+check "style restored, rain exits" '[ -z "$(pid)" ] && [ "$(cat "$modefile" 2>/dev/null)" = "$saved" ]'
+
+# --- 5: gray mosaic (one-off flag)
+mv $out/nightfall.log $out/rain.log; rm -f $out/start-screen0.png
+NIGHTFALL_DEBUG=$out "$bin" --mosaic & sleep 4
+check "--mosaic blanks with the gray mosaic" '[ -n "$(pid)" ] && grep -q "mode=mosaic" $out/nightfall.log && grep -q "^.* mosaic: " $out/nightfall.log && [ -s $out/start-screen0.png ]'
+p=$(pid); [ -n "$p" ] && { t0=$(cut -d" " -f14,15 /proc/$p/stat); sleep 5; t1=$(cut -d" " -f14,15 /proc/$p/stat)
+  echo "mosaic: rss $(ps -o rss= -p $p) KB, cpu $(echo $t0 $t1 | awk '{print ($3+$4-$1-$2)/5 "% of one core"}')"; }
+inp key; sleep 1
+check "key wakes the mosaic" '[ -z "$(pid)" ]'
+
 check "settings restored" '[ "$(gsettings get "$kb" command)" = "$orig" ]'
-echo "---- log"; cat $out/nightfall.log
+echo "---- log"; cat $out/clock.log $out/rain.log $out/nightfall.log
 echo "RESULT: $ok passed, $fail failed"

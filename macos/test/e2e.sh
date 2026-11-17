@@ -35,8 +35,27 @@ echo "blanked: rss $(ps -o rss= -p $p) KB, cpu $(ps -o time= -p $p)"
 sleep 3
 check "autowake key wakes, app stays in menu bar" 'grep -q wake $log && running'
 check "single instance" '[ $(pgrep -x Nightfall | wc -l) -eq 1 ]'
+# --- 3: digital rain
+pkill -x Nightfall; sleep 0.5
+mv $log $out/launch.log
+NIGHTFALL_DEBUG=$out NIGHTFALL_AUTOWAKE=8 "$app/Contents/MacOS/Nightfall" --blank --rain &
+sleep 4; p=$(pgrep -x Nightfall); c0=$(ps -o time= -p $p)
+sleep 3; echo "rain: rss $(ps -o rss= -p $p) KB, cpu $c0 at 4 s -> $(ps -o time= -p $p) at 7 s"
+check "--rain blanks with the digital rain" 'grep -q "style=rain" $log && [ -s $out/start-display0.png ]'
+sleep 3
+check "key wakes the rain" 'grep -q wake $log'
+pkill -x Nightfall; sleep 0.5
+# --- 4: gray mosaic
+mv $log $out/rain.log; rm -f $out/start-display0.png
+NIGHTFALL_DEBUG=$out NIGHTFALL_AUTOWAKE=8 "$app/Contents/MacOS/Nightfall" --blank --mosaic &
+sleep 4; p=$(pgrep -x Nightfall); c0=$(ps -o time= -p $p)
+sleep 3; echo "mosaic: rss $(ps -o rss= -p $p) KB, cpu $c0 at 4 s -> $(ps -o time= -p $p) at 7 s"
+check "--mosaic blanks with the gray mosaic" 'grep -q "style=mosaic" $log && grep -q "mosaic: " $log && [ -s $out/start-display0.png ]'
+sleep 3
+check "key wakes the mosaic" 'grep -q wake $log'
+pkill -x Nightfall; sleep 0.5
 # leave it running normally (no debug env)
 pkill -x Nightfall; sleep 0.5; open "$app"; sleep 1
 check "running normally after test" 'running'
-echo "---- self-test log"; cat $out/selftest.log; echo "---- launch log"; cat $log
+echo "---- self-test log"; cat $out/selftest.log; echo "---- launch log"; cat $out/launch.log; echo "---- rain log"; cat $out/rain.log; echo "---- mosaic log"; cat $log
 echo "RESULT: $ok passed, $fail failed"
