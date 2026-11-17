@@ -100,4 +100,31 @@ Say ("mosaic: working set {0} KB, CPU {1:N1}% of one core" -f [int]($m.WorkingSe
 Input key; Start-Sleep 1
 Check 'key wakes the mosaic' (-not (SaverUp))
 
+# --- the scene-engine styles: each draws something, reports its CPU, and a key wakes it
+Add-Type -ReferencedAssemblies System.Drawing @'
+using System; using System.Drawing; using System.Drawing.Imaging; using System.Runtime.InteropServices;
+public class Px {
+  // fraction of pixels that are not (near) black
+  public static double Lit(string path) {
+    using (var b = new Bitmap(path)) {
+      var d = b.LockBits(new Rectangle(0, 0, b.Width, b.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppRgb);
+      var buf = new byte[d.Stride * b.Height]; Marshal.Copy(d.Scan0, buf, 0, buf.Length); b.UnlockBits(d);
+      long lit = 0;
+      for (int y = 0; y < b.Height; y++) for (int x = 0; x < b.Width; x++) {
+        int i = y * d.Stride + x * 4; if (buf[i] + buf[i + 1] + buf[i + 2] > 24) lit++; }
+      return (double)lit / ((long)b.Width * b.Height);
+    }
+  }
+}
+'@
+foreach ($st in 'stars analog words curves maze life ripples plasma fireflies starfield'.Split(' ')) {
+    $sp = Start-Process $exe -ArgumentList '/s', "/$st" -PassThru; Start-Sleep 3
+    $up = SaverUp
+    $lit = [Px]::Lit((Shot "style-$st"))
+    $c0 = $sp.TotalProcessorTime; Start-Sleep 4; $sp.Refresh()
+    Say ("{0}: working set {1} KB, CPU {2:N1}% of one core, {3:P2} of pixels lit" -f $st, [int]($sp.WorkingSet64 / 1KB), (($sp.TotalProcessorTime - $c0).TotalMilliseconds / 40), $lit)
+    Input key; Start-Sleep 1
+    Check "/$st draws, key wakes it" ($up -and ($lit -gt 0.00004) -and -not (SaverUp))
+}
+
 Say "RESULT: $script:ok passed, $script:fail failed"

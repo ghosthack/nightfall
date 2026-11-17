@@ -26,7 +26,13 @@ jobs:
         with:
           persist-credentials: false
       - run: sudo apt-get update && sudo apt-get install --yes libgtk-4-dev
-      - run: make -C linux && linux/build/nightfall --version
+      - run: make -C linux && linux/build/nightfall --version && linux/build/nightfall --list
+      - name: Shared sources are identical in every platform folder
+        run: |
+          for f in scene.c scene.h; do
+            cmp linux/src/$f windows/src/$f && cmp linux/src/$f macos/src/$f
+          done
+          cmp linux/src/rain.h windows/src/rain.h && cmp linux/src/mosaic.h windows/src/mosaic.h
   macos:
     runs-on: macos-15
     steps:

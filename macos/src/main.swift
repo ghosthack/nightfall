@@ -1,16 +1,17 @@
 // Nightfall for macOS - a tiny menu-bar screen blanker.
 //
-//   - Menu bar moon: click -> menu (Blank Screen Now, Clock / Digital Rain / Gray Mosaic,
-//     Start at Login, Quit)
+//   - Menu bar moon: click -> menu (Blank Screen Now, Style, Start at Login, Quit)
 //   - Global hotkey Ctrl+Option+B (Carbon hotkey: no Accessibility permission needed)
 //   - Opening the app again (Finder, Spotlight, Launchpad, `open -a Nightfall`) blanks now
-//   - `Nightfall --blank` blanks immediately at launch; `--rain` / `--mosaic` / `--clock` override
-//     the saved style for this run
+//   - `Nightfall --blank` blanks immediately at launch; `--STYLE` (e.g. `--rain`, `--stars`,
+//     `--clock`; names in scene.c) overrides the saved style for this run
 //
 // While blanked: a black window above everything on every display, cursor hidden, and either a
 // dim clock that jumps to a random display/spot every 20 s (no burn-in), a dim green digital
 // rain (15 frames/s, redrawing only the cells that change), or a mosaic of dark gray rectangles
-// that slowly crossfade to new shades (15 frames/s, changed cells only). Any key or mouse click wakes it;
+// that slowly crossfade to new shades (15 frames/s, changed cells only), or one of the styles
+// drawn by the shared C scene engine (scene.c), which re-renders only the 64-px tiles that
+// changed. Any key or mouse click wakes it;
 // moving the mouse alone does not.
 //
 // NIGHTFALL_DEBUG=<dir> logs state and saves PNGs of what is drawn.
@@ -42,14 +43,18 @@ func dbg(_ msg: String) {
 
 // MARK: - style
 
-enum Style: String { case clock, rain, mosaic }
+// Styles are the indexes in scene.h (NF_CLOCK, NF_RAIN, ...); clock, rain and mosaic are drawn
+// here, the rest by scene.c. Settings store the name.
+func styleName(_ i: Int) -> String { String(cString: nf_style_name(Int32(i))) }
+func styleTitle(_ i: Int) -> String { String(cString: nf_style_title(Int32(i))) }
+func styleNamed(_ n: String) -> Int? { let v = Int(nf_style_from_name(n)); return v >= 0 ? v : nil }
 
-var styleOverride: Style? = CommandLine.arguments.contains("--rain") ? .rain
-    : CommandLine.arguments.contains("--mosaic") ? .mosaic
-    : CommandLine.arguments.contains("--clock") ? .clock : nil
-var savedStyle: Style {
-    get { Style(rawValue: UserDefaults.standard.string(forKey: "style") ?? "") ?? .clock }
-    set { UserDefaults.standard.set(newValue.rawValue, forKey: "style") }
+var styleOverride: Int? = CommandLine.arguments.compactMap {
+    $0.hasPrefix("--") ? styleNamed(String($0.dropFirst(2))) : nil
+}.first
+var savedStyle: Int {
+    get { styleNamed(UserDefaults.standard.string(forKey: "style") ?? "") ?? NF_CLOCK }
+    set { UserDefaults.standard.set(styleName(newValue), forKey: "style") }
 }
 
 // MARK: - digital rain (same model as linux/src/rain.h and windows/src/rain.h)
@@ -334,6 +339,124 @@ final class MosaicView: NSView {
     }
 }
 
+// MARK: - scene styles (scene.c)
+
+/// Word-clock text for scene.c: white on black, one coverage byte per pixel.
+let sceneText: nf_text_fn = { text, px, w, h, _ in
+    guard let text, let w, let h else { return nil }
+    let str = NSAttributedString(string: String(cString: text),
+                                 attributes: [.font: NSFont.systemFont(ofSize: CGFloat(px), weight: .light),
+                                              .foregroundColor: NSColor.white])
+    let size = str.size()
+    let W = max(1, Int(size.width.rounded(.up))), H = max(1, Int(size.height.rounded(.up)))
+    guard let buf = calloc(W * H, 1)?.assumingMemoryBound(to: UInt8.self),
+          let ctx = CGContext(data: buf, width: W, height: H, bitsPerComponent: 8, bytesPerRow: W,
+                              space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue)
+    else { return nil }
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+    str.draw(at: .zero)
+    NSGraphicsContext.restoreGraphicsState()
+    w.pointee = Int32(W); h.pointee = Int32(H)
+    return buf
+}
+
+/// Layer-hosting view with one layer per lit 64-px tile of the scene's framebuffer. A frame
+/// swaps the image of the few tiles that changed; the window server composites the rest as is.
+final class SceneView: NSView {
+    let scene: OpaquePointer
+    let scale: CGFloat
+    /// The display's own color space: tiles in any other space get converted on the CPU, per frame.
+    let space: CGColorSpace
+    private var tiles: [CALayer?]
+    private let tc: Int, tr: Int, pw: Int, ph: Int
+
+    init?(frame: NSRect, scale: CGFloat, style: Int, space: CGColorSpace?) {
+        pw = Int((frame.width * scale).rounded()); ph = Int((frame.height * scale).rounded())
+        guard let sc = nf_scene_new(Int32(style), Int32(pw), Int32(ph), nil, UInt32.random(in: 1...UInt32.max), sceneText, nil)
+        else { return nil }
+        scene = sc
+        self.scale = scale
+        self.space = space ?? CGColorSpace(name: CGColorSpace.sRGB)!
+        tc = Int(nf_scene_tile_cols(sc)); tr = Int(nf_scene_tile_rows(sc))
+        tiles = Array(repeating: nil, count: tc * tr)
+        super.init(frame: frame)
+        let root = CALayer()
+        root.backgroundColor = CGColor.black
+        root.isGeometryFlipped = true
+        layer = root
+        wantsLayer = true
+        nf_scene_step(sc)
+        present(all: true)
+        dbg("scene: \(styleName(style)) \(pw)x\(ph) px, \(nf_scene_fps(sc)) fps")
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    deinit { nf_scene_free(scene) }
+    override var isOpaque: Bool { true }
+    var fps: Int { Int(nf_scene_fps(scene)) }
+
+    func tick() {
+        if nf_scene_step(scene) > 0 { present(all: false) }
+    }
+
+    private func present(all: Bool) {
+        let px = nf_scene_pixels(scene)!
+        let tile = Int(NF_TILE)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for ty in 0..<tr {
+            for tx in 0..<tc where all || nf_scene_tile_dirty(scene, Int32(tx), Int32(ty)) != 0 {
+                let i = ty * tc + tx
+                guard nf_scene_tile_lit(scene, Int32(tx), Int32(ty)) != 0 else { tiles[i]?.isHidden = true; continue }
+                let x0 = tx * tile, y0 = ty * tile, w = min(tile, pw - x0), h = min(tile, ph - y0)
+                var data = Data(count: w * h * 4)
+                data.withUnsafeMutableBytes { dst in
+                    for y in 0..<h {
+                        memcpy(dst.baseAddress! + y * w * 4, px + (y0 + y) * pw + x0, w * 4)
+                    }
+                }
+                guard let provider = CGDataProvider(data: data as CFData),
+                      let img = CGImage(width: w, height: h, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: w * 4,
+                                        space: space,
+                                        bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue |
+                                                                 CGImageAlphaInfo.premultipliedFirst.rawValue),
+                                        provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+                else { continue }
+                let l: CALayer
+                if let have = tiles[i] { l = have } else {
+                    l = CALayer()
+                    l.frame = CGRect(x: CGFloat(x0) / scale, y: CGFloat(y0) / scale, width: CGFloat(w) / scale, height: CGFloat(h) / scale)
+                    l.isOpaque = true
+                    layer?.addSublayer(l)
+                    tiles[i] = l
+                }
+                l.contents = img
+                l.isHidden = false
+            }
+        }
+        CATransaction.commit()
+    }
+
+    var litTiles: Int {
+        var n = 0
+        for ty in 0..<tr { for tx in 0..<tc where nf_scene_tile_lit(scene, Int32(tx), Int32(ty)) != 0 { n += 1 } }
+        return n
+    }
+
+    /// Debug snapshot: the framebuffer itself.
+    func snapshot(to url: URL) {
+        let data = Data(bytes: nf_scene_pixels(scene)!, count: pw * ph * 4)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let img = CGImage(width: pw, height: ph, bitsPerComponent: 8, bitsPerPixel: 32, bytesPerRow: pw * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                bitmapInfo: CGBitmapInfo(rawValue: CGBitmapInfo.byteOrder32Little.rawValue |
+                                                         CGImageAlphaInfo.premultipliedFirst.rawValue),
+                                provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+        else { return }
+        try? NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:])?.write(to: url)
+    }
+}
+
 // MARK: - blank windows
 
 final class BlankWindow: NSWindow {
@@ -390,9 +513,10 @@ final class Blanker {
     private var views: [ClockView] = []
     private var rainViews: [RainView] = []
     private var mosaicViews: [MosaicView] = []
+    private var sceneViews: [SceneView] = []
     private var timer: Timer?
     private var rainTimer: Timer?
-    private(set) var style: Style = .clock
+    private(set) var style = NF_CLOCK
     private var started = Date()
     private var lastMove = Date()
     private var ticks = 0
@@ -416,11 +540,16 @@ final class Blanker {
             w.acceptsMouseMovedEvents = true
             w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
             let v = ClockView(frame: NSRect(origin: .zero, size: screen.frame.size))
-            if style == .rain {
+            if style >= NF_STARS, let sv = SceneView(frame: NSRect(origin: .zero, size: screen.frame.size),
+                                                    scale: screen.backingScaleFactor, style: style,
+                                                    space: screen.colorSpace?.cgColorSpace) {
+                w.contentView = sv
+                sceneViews.append(sv)
+            } else if style == NF_RAIN {
                 let rv = RainView(frame: NSRect(origin: .zero, size: screen.frame.size), scale: screen.backingScaleFactor)
                 w.contentView = rv
                 rainViews.append(rv)
-            } else if style == .mosaic {
+            } else if style == NF_MOSAIC {
                 let mv = MosaicView(frame: NSRect(origin: .zero, size: screen.frame.size), scale: screen.backingScaleFactor)
                 w.contentView = mv
                 mosaicViews.append(mv)
@@ -442,14 +571,21 @@ final class Blanker {
         t.tolerance = 0.5
         RunLoop.main.add(t, forMode: .common)
         timer = t
-        if style == .rain {
+        if style >= NF_STARS, let fps = sceneViews.first?.fps {
+            let st = Timer(timeInterval: 1 / Double(fps), repeats: true) { [weak self] _ in
+                self?.sceneViews.forEach { $0.tick() }
+            }
+            st.tolerance = 0.01
+            RunLoop.main.add(st, forMode: .common)
+            rainTimer = st
+        } else if style == NF_RAIN {
             let rt = Timer(timeInterval: 1 / rainFPS, repeats: true) { [weak self] _ in
                 self?.rainViews.forEach { $0.tick() }
             }
             rt.tolerance = 0.01
             RunLoop.main.add(rt, forMode: .common)
             rainTimer = rt
-        } else if style == .mosaic {
+        } else if style == NF_MOSAIC {
             let mt = Timer(timeInterval: 1 / mosaicFPS, repeats: true) { [weak self] _ in
                 self?.mosaicViews.forEach { $0.tick() }
             }
@@ -457,7 +593,7 @@ final class Blanker {
             RunLoop.main.add(mt, forMode: .common)
             rainTimer = mt
         }
-        dbg("blank: \(windows.count) display(s) style=\(style.rawValue)")
+        dbg("blank: \(windows.count) display(s) style=\(styleName(style))")
         if let secs = Double(ProcessInfo.processInfo.environment["NIGHTFALL_AUTOWAKE"] ?? "") {
             // test hook: deliver a real keyDown through the app's event path after `secs`
             DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
@@ -486,7 +622,7 @@ final class Blanker {
     private func tick() {
         ticks += 1
         if debugDir != nil && ticks == 3 { dump("start") }
-        if style != .clock { return }
+        if style != NF_CLOCK { return }
         if Date().timeIntervalSince(lastMove) >= Double(moveSeconds) {   // wall clock: timers drift
             if debugDir != nil { dump("before-move") }
             moveClock()
@@ -508,7 +644,7 @@ final class Blanker {
         timer?.invalidate(); timer = nil
         rainTimer?.invalidate(); rainTimer = nil
         for w in windows { w.orderOut(nil); w.close() }
-        windows.removeAll(); views.removeAll(); rainViews.removeAll(); mosaicViews.removeAll()
+        windows.removeAll(); views.removeAll(); rainViews.removeAll(); mosaicViews.removeAll(); sceneViews.removeAll()
         NSCursor.unhide()
         NSApp.presentationOptions = []
         prevApp?.activate()
@@ -524,7 +660,10 @@ final class Blanker {
             dbg("\(tag) display=\(i) size=\(Int(w.frame.width))x\(Int(w.frame.height)) " +
                 "covers=\(w.frame == w.screen?.frame) key=\(w.isKeyWindow) visible=\(w.isVisible) " +
                 "level=\(w.level.rawValue) clock_here=\(views[i].showClock) app_active=\(NSApp.isActive)")
-            if let rv = v as? RainView {
+            if let sv = v as? SceneView {
+                dbg("\(tag) display=\(i) lit_tiles=\(sv.litTiles)")
+                sv.snapshot(to: URL(fileURLWithPath: dir).appendingPathComponent("\(tag)-display\(i).png"))
+            } else if let rv = v as? RainView {
                 rv.snapshot(to: URL(fileURLWithPath: dir).appendingPathComponent("\(tag)-display\(i).png"),
                             scale: w.backingScaleFactor)
             } else if let mv = v as? MosaicView {
@@ -550,9 +689,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var hotKeyRef: EventHotKeyRef?
     var hotKeyOK = false
     var loginItem: NSMenuItem!
-    var clockItem: NSMenuItem!
-    var rainItem: NSMenuItem!
-    var mosaicItem: NSMenuItem!
+    var styleItems: [NSMenuItem] = []
 
     func applicationDidFinishLaunching(_ n: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -566,10 +703,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         blankItem.keyEquivalentModifierMask = [.control, .option]
         menu.addItem(blankItem)
         menu.addItem(.separator())
-        clockItem = NSMenuItem(title: "Clock", action: #selector(pickClock), keyEquivalent: "")
-        rainItem = NSMenuItem(title: "Digital Rain", action: #selector(pickRain), keyEquivalent: "")
-        mosaicItem = NSMenuItem(title: "Gray Mosaic", action: #selector(pickMosaic), keyEquivalent: "")
-        menu.addItem(clockItem); menu.addItem(rainItem); menu.addItem(mosaicItem)
+        let styles = NSMenu()
+        for i in 0..<NF_STYLE_COUNT {
+            let item = NSMenuItem(title: styleTitle(i), action: #selector(pickStyle(_:)), keyEquivalent: "")
+            item.tag = i
+            styles.addItem(item)
+            styleItems.append(item)
+        }
+        let styleMenu = NSMenuItem(title: "Style", action: nil, keyEquivalent: "")
+        styleMenu.submenu = styles
+        menu.addItem(styleMenu)
         menu.addItem(.separator())
         loginItem = NSMenuItem(title: "Start at Login", action: #selector(toggleLogin), keyEquivalent: "")
         menu.addItem(loginItem)
@@ -595,9 +738,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func blankNow() { blanker.start() }
-    @objc func pickClock() { savedStyle = .clock; styleOverride = nil }
-    @objc func pickRain() { savedStyle = .rain; styleOverride = nil }
-    @objc func pickMosaic() { savedStyle = .mosaic; styleOverride = nil }
+    @objc func pickStyle(_ sender: NSMenuItem) { savedStyle = sender.tag; styleOverride = nil }
 
     @objc func toggleLogin() {
         let svc = SMAppService.mainApp
@@ -664,9 +805,7 @@ extension AppDelegate: NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         loginItem.state = SMAppService.mainApp.status == .enabled ? .on : .off
         let st = styleOverride ?? savedStyle
-        clockItem.state = st == .clock ? .on : .off
-        rainItem.state = st == .rain ? .on : .off
-        mosaicItem.state = st == .mosaic ? .on : .off
+        for item in styleItems { item.state = item.tag == st ? .on : .off }
     }
 }
 

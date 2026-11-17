@@ -54,8 +54,19 @@ check "--mosaic blanks with the gray mosaic" 'grep -q "style=mosaic" $log && gre
 sleep 3
 check "key wakes the mosaic" 'grep -q wake $log'
 pkill -x Nightfall; sleep 0.5
+# --- 5: the scene-engine styles: each draws something, reports its CPU, and a key wakes it
+mv $log $out/mosaic.log
+for st in stars analog words curves maze life ripples plasma fireflies starfield; do
+  rm -f $log
+  NIGHTFALL_DEBUG=$out NIGHTFALL_AUTOWAKE=7 "$app/Contents/MacOS/Nightfall" --blank --$st &
+  sleep 4; p=$(pgrep -x Nightfall); c0=$(ps -o cputime= -p $p)
+  sleep 2.5; echo "$st: rss $(ps -o rss= -p $p) KB, cpu $c0 at 4 s -> $(ps -o cputime= -p $p) at 6.5 s"
+  sleep 1.5
+  check "--$st draws, key wakes it" 'grep -q "scene: $st" $log && grep -q "lit_tiles=[1-9]" $log && grep -q wake $log'
+  pkill -x Nightfall; sleep 0.5
+done
 # leave it running normally (no debug env)
 pkill -x Nightfall; sleep 0.5; open "$app"; sleep 1
 check "running normally after test" 'running'
-echo "---- self-test log"; cat $out/selftest.log; echo "---- launch log"; cat $out/launch.log; echo "---- rain log"; cat $out/rain.log; echo "---- mosaic log"; cat $log
+echo "---- self-test log"; cat $out/selftest.log; echo "---- launch log"; cat $out/launch.log; echo "---- rain log"; cat $out/rain.log; echo "---- mosaic log"; cat $out/mosaic.log
 echo "RESULT: $ok passed, $fail failed"

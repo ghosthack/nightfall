@@ -67,6 +67,24 @@ p=$(pid); [ -n "$p" ] && { t0=$(cut -d" " -f14,15 /proc/$p/stat); sleep 5; t1=$(
 inp key; sleep 1
 check "key wakes the mosaic" '[ -z "$(pid)" ]'
 
+# --- 6: the scene-engine styles: each draws something, reports its CPU, and a key wakes it
+mv $out/nightfall.log $out/mosaic.log
+for st in stars analog words curves maze life ripples plasma fireflies starfield; do
+  rm -f $out/nightfall.log
+  NIGHTFALL_DEBUG=$out "$bin" --$st &
+  drew=0
+  for i in $(seq 16); do   # the first debug snapshot lands 2-3 s after launch
+    sleep 0.5
+    grep -q "scene: $st" $out/nightfall.log 2>/dev/null && grep -q "lit_tiles=[1-9]" $out/nightfall.log && { drew=1; break; }
+  done
+  p=$(pid)
+  [ -n "$p" ] && { t0=$(cut -d" " -f14,15 /proc/$p/stat); sleep 4; t1=$(cut -d" " -f14,15 /proc/$p/stat)
+    echo "$st: rss $(ps -o rss= -p $p) KB, cpu $(echo $t0 $t1 | awk '{print ($3+$4-$1-$2)/4 "% of one core"}')"; }
+  inp key; sleep 1
+  check "--$st draws, key wakes it" '[ $drew = 1 ] && [ -z "$(pid)" ]'
+  pkill -x nightfall
+done
+
 check "settings restored" '[ "$(gsettings get "$kb" command)" = "$orig" ]'
-echo "---- log"; cat $out/clock.log $out/rain.log $out/nightfall.log
+echo "---- log"; cat $out/clock.log $out/rain.log $out/mosaic.log
 echo "RESULT: $ok passed, $fail failed"

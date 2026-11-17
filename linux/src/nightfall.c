@@ -2,13 +2,15 @@
  * Nightfall for Linux (GTK4, Wayland or X11) - a tiny screen blanker.
  *
  *   nightfall                 blank every monitor now with the saved style; exits on wake
- *   nightfall --rain|--mosaic|--clock   blank now with that style (this time only)
- *   nightfall --set-mode rain|mosaic|clock   save the default style (~/.config/nightfall/mode)
+ *   nightfall --STYLE         blank now with that style (this time only), e.g. --rain
+ *   nightfall --set-mode STYLE   save the default style (~/.config/nightfall/mode)
+ *   nightfall --list          list the styles
  *
  * While blanked: a black fullscreen window per monitor, cursor hidden, and either a dim
  * clock that jumps to a random monitor/spot every 20 s (no burn-in), a dim green
- * "digital rain" that redraws only the cells that change, 15 times a second, or a
- * mosaic of dark gray rectangles that slowly crossfade to new shades.
+ * "digital rain", a slowly shifting gray mosaic, or one of the styles drawn by the shared
+ * scene engine (scene.c: stars, analog and word clocks, curves, maze, life, ripples,
+ * plasma, fireflies, starfield). The animated styles redraw only what changed.
  * Wake with any key or mouse click; moving the mouse alone does not wake it.
  * Nothing stays resident: launch it from the dock/app grid or the Ctrl+Alt+B
  * GNOME shortcut that install.sh sets up.
@@ -17,6 +19,7 @@
 #include <math.h>
 #include "rain.h"
 #include "mosaic.h"
+#include "scene.h"
 
 #define GRACE_US   (800 * 1000)   /* ignore input right after blanking */
 #define MOVE_SEC   20             /* move the clock this often */
@@ -35,10 +38,13 @@ typedef struct {
     double scale;
     /* mosaic mode: one color node per lit cell; GTK repaints only the cells that changed */
     Mosaic mosaic;
+    /* scene styles: one texture node per lit 64-px tile, re-uploaded only when it changed */
+    NfScene *scene;
+    GdkTexture **tile;
+    unsigned char *pending;            /* changed since the last snapshot */
 } Screen;
 
-enum { MODE_CLOCK, MODE_RAIN, MODE_MOSAIC };
-static const char *const MODE_NAMES[] = { "clock", "rain", "mosaic" };
+enum { MODE_CLOCK = NF_CLOCK, MODE_RAIN = NF_RAIN, MODE_MOSAIC = NF_MOSAIC };
 static int g_mode = MODE_CLOCK;
 
 static GtkApplication *g_app;
@@ -74,6 +80,12 @@ static void debug_dump(const char *tag)
         int pw = gtk_widget_get_width(s->window), ph = gtk_widget_get_height(s->window);
         dbg("%s screen=%d size=%dx%d fullscreen=%d active=%d clock_here=%d", tag, i,
             pw, ph, gtk_window_is_fullscreen(w), gtk_window_is_active(w), i == g_clock_screen);
+        if (s->scene) {
+            int lit = 0;
+            for (int ty = 0; ty < nf_scene_tile_rows(s->scene); ty++)
+                for (int tx = 0; tx < nf_scene_tile_cols(s->scene); tx++) lit += nf_scene_tile_lit(s->scene, tx, ty);
+            dbg("%s screen=%d lit_tiles=%d", tag, i, lit);
+        }
         GdkPaintable *p = gtk_widget_paintable_new(s->window);
         GtkSnapshot *snap = gtk_snapshot_new();
         gdk_paintable_snapshot(p, snap, pw, ph);
@@ -114,6 +126,14 @@ static void rain_free_screen(Screen *s)
         for (int g = 0; g < RAIN_GLYPHS; g++) g_clear_object(&s->tex[l][g]);
     rain_free(&s->rain);
     mosaic_free(&s->mosaic);
+    if (s->scene) {
+        int n = nf_scene_tile_cols(s->scene) * nf_scene_tile_rows(s->scene);
+        for (int i = 0; i < n; i++) g_clear_object(&s->tile[i]);
+        nf_scene_free(s->scene);
+        s->scene = NULL;
+    }
+    g_clear_pointer(&s->tile, g_free);
+    g_clear_pointer(&s->pending, g_free);
 }
 
 /* Render every glyph at every brightness once, c x c device pixels each. */
@@ -218,13 +238,89 @@ static void mosaic_snapshot(Screen *s, GtkWidget *widget, GtkSnapshot *snap)
         }
 }
 
+/* ---------- scene styles ---------- */
+
+static unsigned char *text_mask(const char *utf8, int px, int *w, int *h, void *ctx)
+{
+    PangoLayout *l = gtk_widget_create_pango_layout(GTK_WIDGET(ctx), utf8);
+    PangoFontDescription *f = pango_font_description_from_string("Sans Light");
+    pango_font_description_set_absolute_size(f, px * PANGO_SCALE);
+    pango_layout_set_font_description(l, f);
+    pango_font_description_free(f);
+    int tw, th;
+    pango_layout_get_pixel_size(l, &tw, &th);
+    tw = tw > 0 ? tw : 1; th = th > 0 ? th : 1;
+    cairo_surface_t *surf = cairo_image_surface_create(CAIRO_FORMAT_A8, tw, th);
+    cairo_t *cr = cairo_create(surf);
+    pango_cairo_show_layout(cr, l);
+    cairo_destroy(cr);
+    cairo_surface_flush(surf);
+    unsigned char *out = malloc((size_t)tw * th);
+    if (out) {
+        int stride = cairo_image_surface_get_stride(surf);
+        const unsigned char *src = cairo_image_surface_get_data(surf);
+        for (int y = 0; y < th; y++) memcpy(out + (size_t)y * tw, src + (size_t)y * stride, (size_t)tw);
+    }
+    cairo_surface_destroy(surf);
+    g_object_unref(l);
+    *w = tw; *h = th;
+    return out;
+}
+
+static void scene_snapshot(Screen *s, GtkWidget *widget, GtkSnapshot *snap)
+{
+    int w = gtk_widget_get_width(widget), h = gtk_widget_get_height(widget);
+    double scale = widget_scale(widget);
+    if (w <= 0 || h <= 0) return;
+    if (!s->scene || s->view_w != w || s->view_h != h || s->scale != scale) {
+        rain_free_screen(s);
+        s->scale = scale; s->view_w = w; s->view_h = h;
+        int pw = (int)ceil(w * scale), ph = (int)ceil(h * scale);
+        s->scene = nf_scene_new(g_mode, pw, ph, NULL, g_random_int(), text_mask, widget);
+        if (!s->scene) return;
+        int n = nf_scene_tile_cols(s->scene) * nf_scene_tile_rows(s->scene);
+        s->tile = g_new0(GdkTexture *, n);
+        s->pending = g_new0(unsigned char, n);
+        dbg("scene: %s %dx%d device px, scale %.2f, %d fps", nf_style_name(g_mode), pw, ph, scale, nf_scene_fps(s->scene));
+        nf_scene_step(s->scene);
+        memset(s->pending, 1, n);
+    }
+    NfScene *sc = s->scene;
+    int tc = nf_scene_tile_cols(sc), tr = nf_scene_tile_rows(sc), pw = nf_scene_width(sc), ph = nf_scene_height(sc);
+    const uint32_t *px = nf_scene_pixels(sc);
+    for (int ty = 0; ty < tr; ty++)
+        for (int tx = 0; tx < tc; tx++) {
+            int i = ty * tc + tx;
+            if (s->pending[i]) {
+                s->pending[i] = 0;
+                g_clear_object(&s->tile[i]);
+                if (nf_scene_tile_lit(sc, tx, ty)) {
+                    int x0 = tx * NF_TILE, y0 = ty * NF_TILE;
+                    int tw = MIN(NF_TILE, pw - x0), th = MIN(NF_TILE, ph - y0);
+                    guchar *buf = g_malloc((gsize)tw * th * 4);
+                    for (int y = 0; y < th; y++) memcpy(buf + (gsize)y * tw * 4, px + (gsize)(y0 + y) * pw + x0, (gsize)tw * 4);
+                    GBytes *b = g_bytes_new_take(buf, (gsize)tw * th * 4);
+                    s->tile[i] = gdk_memory_texture_new(tw, th, GDK_MEMORY_B8G8R8A8_PREMULTIPLIED, b, (gsize)tw * 4);
+                    g_bytes_unref(b);
+                }
+            }
+            if (s->tile[i]) {
+                int x0 = tx * NF_TILE, y0 = ty * NF_TILE;
+                int tw = gdk_texture_get_width(s->tile[i]), th = gdk_texture_get_height(s->tile[i]);
+                gtk_snapshot_append_texture(snap, s->tile[i],
+                    &GRAPHENE_RECT_INIT(x0 / scale, y0 / scale, tw / scale, th / scale));
+            }
+        }
+}
+
 /* the animated styles draw into this widget */
 typedef struct { GtkWidget parent; Screen *screen; } NfRainView;
 typedef struct { GtkWidgetClass parent_class; } NfRainViewClass;
 G_DEFINE_TYPE(NfRainView, nf_rain_view, GTK_TYPE_WIDGET)
 static void nf_rain_view_snapshot(GtkWidget *w, GtkSnapshot *snap)
 {
-    if (g_mode == MODE_MOSAIC) mosaic_snapshot(((NfRainView *)w)->screen, w, snap);
+    if (g_mode >= NF_FIRST_SCENE) scene_snapshot(((NfRainView *)w)->screen, w, snap);
+    else if (g_mode == MODE_MOSAIC) mosaic_snapshot(((NfRainView *)w)->screen, w, snap);
     else rain_snapshot(((NfRainView *)w)->screen, w, snap);
 }
 static void nf_rain_view_class_init(NfRainViewClass *k) { GTK_WIDGET_CLASS(k)->snapshot = nf_rain_view_snapshot; }
@@ -238,6 +334,13 @@ static gboolean rain_tick(gpointer data)
         Screen *s = &g_screens[i];
         if (s->rain.col) rain_step(&s->rain);
         else if (s->mosaic.cell) mosaic_step(&s->mosaic);
+        else if (s->scene) {
+            if (!nf_scene_step(s->scene)) continue;          /* nothing changed: no redraw */
+            int tc = nf_scene_tile_cols(s->scene), tr = nf_scene_tile_rows(s->scene);
+            for (int ty = 0; ty < tr; ty++)
+                for (int tx = 0; tx < tc; tx++)
+                    if (nf_scene_tile_dirty(s->scene, tx, ty)) s->pending[ty * tc + tx] = 1;
+        }
         else continue;
         gtk_widget_queue_draw(s->rainview);
     }
@@ -408,10 +511,17 @@ static void activate(GtkApplication *app, gpointer data)
 
     g_start_us = g_get_monotonic_time();
     move_clock();
-    dbg("blank: %u monitor(s) mode=%s", n, MODE_NAMES[g_mode]);
+    dbg("blank: %u monitor(s) mode=%s", n, nf_style_name(g_mode));
     g_timeout_add_seconds(1, tick, NULL);
     if (g_mode == MODE_RAIN) g_timeout_add(1000 / RAIN_FPS, rain_tick, NULL);
     if (g_mode == MODE_MOSAIC) g_timeout_add(1000 / MOSAIC_FPS, rain_tick, NULL);
+    if (g_mode >= NF_FIRST_SCENE) {
+        /* same frame rate as the scene; a probe scene tells it without knowing the size yet */
+        NfScene *probe = nf_scene_new(g_mode, 64, 64, NULL, 1, NULL, NULL);
+        int fps = probe ? nf_scene_fps(probe) : 15;
+        nf_scene_free(probe);
+        g_timeout_add(1000 / fps, rain_tick, NULL);
+    }
 }
 
 #ifndef NIGHTFALL_VERSION
@@ -425,9 +535,7 @@ static char *mode_file(void)
 
 static int parse_mode(const char *m)
 {
-    for (int i = 0; i < (int)G_N_ELEMENTS(MODE_NAMES); i++)
-        if (g_strcmp0(m, MODE_NAMES[i]) == 0) return i;
-    return -1;
+    return m ? nf_style_from_name(m) : -1;
 }
 
 int main(int argc, char **argv)
@@ -436,18 +544,21 @@ int main(int argc, char **argv)
         g_print("nightfall %s\n", NIGHTFALL_VERSION);
         return 0;
     }
+    if (argc > 1 && g_strcmp0(argv[1], "--list") == 0) {
+        for (int i = 0; i < NF_STYLE_COUNT; i++) g_print("%-10s %s\n", nf_style_name(i), nf_style_title(i));
+        return 0;
+    }
     if (argc > 1 && g_strcmp0(argv[1], "--set-mode") == 0) {
-        if (argc < 3 || parse_mode(argv[2]) < 0) { g_printerr("usage: nightfall --set-mode rain|mosaic|clock\n"); return 2; }
+        if (argc < 3 || parse_mode(argv[2]) < 0) { g_printerr("usage: nightfall --set-mode STYLE (see --list)\n"); return 2; }
         char *path = mode_file(), *dir = g_path_get_dirname(path);
         g_mkdir_with_parents(dir, 0755);
         GError *err = NULL;
         if (!g_file_set_contents(path, argv[2], -1, &err)) { g_printerr("%s\n", err->message); return 1; }
-        static const char *const desc[] = { "clock", "digital rain", "gray mosaic" };
-        g_print("Nightfall will blank with the %s\n", desc[parse_mode(argv[2])]);
+        g_print("Nightfall will blank with: %s\n", nf_style_title(parse_mode(argv[2])));
         g_free(path); g_free(dir);
         return 0;
     }
-    /* saved style, then a one-off --rain / --mosaic / --clock (removed before GApplication sees argv) */
+    /* saved style, then a one-off --STYLE (removed before GApplication sees argv) */
     char *path = mode_file(), *saved = NULL;
     if (g_file_get_contents(path, &saved, NULL, NULL)) {
         int m = parse_mode(g_strstrip(saved));
@@ -456,16 +567,16 @@ int main(int argc, char **argv)
     g_free(saved); g_free(path);
     int kept = 1;
     for (int i = 1; i < argc; i++) {
-        if (g_strcmp0(argv[i], "--rain") == 0) g_mode = MODE_RAIN;
-        else if (g_strcmp0(argv[i], "--mosaic") == 0) g_mode = MODE_MOSAIC;
-        else if (g_strcmp0(argv[i], "--clock") == 0) g_mode = MODE_CLOCK;
+        int m = g_str_has_prefix(argv[i], "--") ? nf_style_from_name(argv[i] + 2) : -1;
+        if (m >= 0) g_mode = m;
         else argv[kept++] = argv[i];
     }
     argc = kept; argv[argc] = NULL;
     /* the clock is a black screen with a little text: software rendering, no GPU context.
      * The rain and mosaic animate a few hundred cells 15x a second, which GTK's GPU renderer composites
      * for a fraction of the CPU its software renderer needs. */
-    if (g_mode == MODE_CLOCK) g_setenv("GSK_RENDERER", "cairo", FALSE);
+    if (g_mode == MODE_CLOCK || g_mode == NF_ANALOG || g_mode == NF_WORDS)   /* 1-2 frames a second */
+        g_setenv("GSK_RENDERER", "cairo", FALSE);
     g_debug = g_getenv("NIGHTFALL_DEBUG");
     g_app = gtk_application_new("io.github.nightfall", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(g_app, "activate", G_CALLBACK(activate), NULL);

@@ -28,7 +28,7 @@ Icon=nightfall
 Terminal=false
 Categories=Utility;
 StartupNotify=false
-Actions=rain;mosaic;clock;
+Actions=rain;mosaic;stars;analog;words;curves;maze;life;ripples;plasma;fireflies;starfield;clock;
 
 [Desktop Action rain]
 Name=Blank with Digital Rain
@@ -37,6 +37,46 @@ Exec=$bin --rain
 [Desktop Action mosaic]
 Name=Blank with Gray Mosaic
 Exec=$bin --mosaic
+
+[Desktop Action stars]
+Name=Blank with Twinkling Stars
+Exec=$bin --stars
+
+[Desktop Action analog]
+Name=Blank with Analog Clock
+Exec=$bin --analog
+
+[Desktop Action words]
+Name=Blank with Word Clock
+Exec=$bin --words
+
+[Desktop Action curves]
+Name=Blank with Curves
+Exec=$bin --curves
+
+[Desktop Action maze]
+Name=Blank with Maze
+Exec=$bin --maze
+
+[Desktop Action life]
+Name=Blank with Life
+Exec=$bin --life
+
+[Desktop Action ripples]
+Name=Blank with Ripples
+Exec=$bin --ripples
+
+[Desktop Action plasma]
+Name=Blank with Plasma
+Exec=$bin --plasma
+
+[Desktop Action fireflies]
+Name=Blank with Fireflies
+Exec=$bin --fireflies
+
+[Desktop Action starfield]
+Name=Blank with Starfield
+Exec=$bin --starfield
 
 [Desktop Action clock]
 Name=Blank with Clock
