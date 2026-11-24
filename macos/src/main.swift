@@ -149,7 +149,8 @@ final class RainView: NSView {
         super.init(frame: frame)
         let root = CALayer()
         root.backgroundColor = CGColor.black
-        root.isGeometryFlipped = true
+        // Not geometry-flipped (AppKit doesn't keep that on a hosting layer, so rain fell upward):
+        // rows are placed from the top explicitly below.
         layer = root
         wantsLayer = true
         makeTiles(scale: scale)
@@ -194,7 +195,7 @@ final class RainView: NSView {
             let l: CALayer
             if let have = cells[i] { l = have } else {
                 l = CALayer()
-                l.frame = CGRect(x: CGFloat(c) * cell, y: CGFloat(row) * cell, width: cell, height: cell)
+                l.frame = CGRect(x: CGFloat(c) * cell, y: bounds.height - CGFloat(row + 1) * cell, width: cell, height: cell)
                 l.isOpaque = true
                 layer?.addSublayer(l)
                 cells[i] = l
@@ -383,7 +384,8 @@ final class SceneView: NSView {
         super.init(frame: frame)
         let root = CALayer()
         root.backgroundColor = CGColor.black
-        root.isGeometryFlipped = true
+        // Not geometry-flipped: tiles are placed bottom-up below, so the layer tree means the
+        // same thing on screen and in render(in:), which the debug check below relies on.
         layer = root
         wantsLayer = true
         nf_scene_step(sc)
@@ -425,7 +427,8 @@ final class SceneView: NSView {
                 let l: CALayer
                 if let have = tiles[i] { l = have } else {
                     l = CALayer()
-                    l.frame = CGRect(x: CGFloat(x0) / scale, y: CGFloat(y0) / scale, width: CGFloat(w) / scale, height: CGFloat(h) / scale)
+                    l.frame = CGRect(x: CGFloat(x0) / scale, y: CGFloat(ph - y0 - h) / scale,
+                                     width: CGFloat(w) / scale, height: CGFloat(h) / scale)
                     l.isOpaque = true
                     layer?.addSublayer(l)
                     tiles[i] = l
@@ -454,6 +457,35 @@ final class SceneView: NSView {
                                 provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
         else { return }
         try? NSBitmapImageRep(cgImage: img).representation(using: .png, properties: [:])?.write(to: url)
+        // What the layers show, rendered in the tiles' own color space so the bytes should match
+        // the framebuffer. A mismatch means tiles are placed, flipped or scaled wrong on screen.
+        guard let root = layer,
+              let ctx = CGContext(data: nil, width: pw, height: ph, bitsPerComponent: 8, bytesPerRow: pw * 4,
+                                  space: space,
+                                  bitmapInfo: CGBitmapInfo.byteOrder32Little.rawValue |
+                                              CGImageAlphaInfo.premultipliedFirst.rawValue),
+              let lp = ctx.data?.assumingMemoryBound(to: UInt32.self) else { return }
+        ctx.scaleBy(x: scale, y: scale)
+        root.render(in: ctx)
+        if let li = ctx.makeImage() {
+            try? NSBitmapImageRep(cgImage: li).representation(using: .png, properties: [:])?
+                .write(to: url.deletingPathExtension().appendingPathExtension("layers.png"))
+        }
+        // Over the pixels lit in either image: the share whose channels differ by at most 6.
+        // CGContext memory is top row first, like the framebuffer.
+        let fb = nf_scene_pixels(scene)!
+        var lit = 0, same = 0
+        for i in 0..<(pw * ph) {
+            let a = fb[i], b = lp[i]
+            let ma = max(a & 0xFF, (a >> 8) & 0xFF, (a >> 16) & 0xFF)
+            let mb = max(b & 0xFF, (b >> 8) & 0xFF, (b >> 16) & 0xFF)
+            guard ma > 8 || mb > 8 else { continue }
+            lit += 1
+            var ok = true
+            for sh in [0, 8, 16] where abs(Int((a >> UInt32(sh)) & 0xFF) - Int((b >> UInt32(sh)) & 0xFF)) > 6 { ok = false }
+            if ok { same += 1 }
+        }
+        dbg("layers_match=\(lit == 0 ? 1 : Double(same) / Double(lit)) lit_px=\(lit)")
     }
 }
 

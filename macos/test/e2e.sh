@@ -63,6 +63,8 @@ for st in stars analog words curves maze life ripples plasma fireflies starfield
   sleep 2.5; echo "$st: rss $(ps -o rss= -p $p) KB, cpu $c0 at 4 s -> $(ps -o cputime= -p $p) at 6.5 s"
   sleep 1.5
   check "--$st draws, key wakes it" 'grep -q "scene: $st" $log && grep -q "lit_tiles=[1-9]" $log && grep -q wake $log'
+  # the layers on screen must show the framebuffer: catches tiles placed, flipped or scaled wrong
+  check "--$st layers match its frame" 'grep -q "layers_match=" $log && ! grep -q "layers_match=0\.[0-8]" $log && ! grep -q "layers_match=0\.9[0-8]" $log'
   pkill -x Nightfall; sleep 0.5
 done
 # leave it running normally (no debug env)
